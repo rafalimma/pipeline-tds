@@ -1,0 +1,204 @@
+name: tds-data-pipeline-dev
+
+# Configuração reutilizável para os containers do Airflow.
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+
+  image: ${AIRFLOW_IMAGE_NAME}
+
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Banco de metadados do Airflow.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${AIRFLOW_META_USER}:${AIRFLOW_META_PASSWORD}@postgres-airflow-meta:5432/${AIRFLOW_META_DB}
+
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: >-
+      postgresql+asyncpg://${AIRFLOW_META_USER}:${AIRFLOW_META_PASSWORD}@postgres-airflow-meta:5432/${AIRFLOW_META_DB}
+
+    # Criptografia de Connections e Variables.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+
+    # Autenticação simplificada apenas para desenvolvimento.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: >-
+      /opt/airflow/config/simple_auth_manager_passwords.json.generated
+
+    # API do Airflow.
+    AIRFLOW__API__BASE_URL: http://localhost:8080
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: >-
+      http://airflow-api-server:8080/execution/
+
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+
+    PYTHONPATH: /opt/airflow
+
+  user: "${AIRFLOW_UID:-50000}:0"
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./pipelines:/opt/airflow/pipelines
+    - ./sql:/opt/airflow/sql
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+
+  networks:
+    - airflow_net
+    - data_net
+
+  depends_on:
+    postgres-airflow-meta:
+      condition: service_healthy
+
+services:
+
+  # Banco principal do Data Warehouse.
+  postgres-warehouse:
+    image: postgres:16-bookworm
+    container_name: tds-dev-postgres-warehouse
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${WAREHOUSE_DB}
+      POSTGRES_USER: ${WAREHOUSE_USER}
+      POSTGRES_PASSWORD: ${WAREHOUSE_PASSWORD}
+      TZ: America/Sao_Paulo
+      PGTZ: America/Sao_Paulo
+
+    ports:
+      - "127.0.0.1:5433:5432"
+
+    volumes:
+      - warehouse_pgdata:/var/lib/postgresql/data
+      - ./sql/bootstrap:/docker-entrypoint-initdb.d:ro
+
+    networks:
+      - data_net
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Banco exclusivo para metadados do Airflow.
+  postgres-airflow-meta:
+    image: postgres:16-bookworm
+    container_name: tds-dev-postgres-airflow-meta
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${AIRFLOW_META_DB}
+      POSTGRES_USER: ${AIRFLOW_META_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_META_PASSWORD}
+      TZ: America/Sao_Paulo
+      PGTZ: America/Sao_Paulo
+
+    volumes:
+      - airflow_meta_pgdata:/var/lib/postgresql/data
+
+    networks:
+      - airflow_net
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Interface web e API REST.
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: tds-dev-airflow-api-server
+    command: api-server
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail http://localhost:8080/api/v2/monitor/health || exit 1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Agenda DAGs e executa tarefas com LocalExecutor.
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: tds-dev-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+
+    depends_on:
+      postgres-airflow-meta:
+        condition: service_healthy
+      airflow-api-server:
+        condition: service_healthy
+
+  # Processa e valida os arquivos das DAGs.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: tds-dev-airflow-dag-processor
+    command: dag-processor
+    restart: unless-stopped
+
+  # Executa tarefas deferrable e aguarda jobs do Airbyte.
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: tds-dev-airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+
+    depends_on:
+      postgres-airflow-meta:
+        condition: service_healthy
+      airflow-api-server:
+        condition: service_healthy
+
+  # Container temporário para migrations do Airflow.
+  airflow-init:
+    <<: *airflow-common
+    container_name: tds-dev-airflow-init
+    restart: "no"
+
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow version
+
+volumes:
+
+  warehouse_pgdata:
+    name: tds_dev_warehouse_pgdata
+
+  airflow_meta_pgdata:
+    name: tds_dev_airflow_meta_pgdata
+
+networks:
+
+  data_net:
+    name: tds_dev_data_net
+
+  airflow_net:
+    name: tds_dev_airflow_net
