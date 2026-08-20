@@ -11,6 +11,7 @@ x-airflow-common: &airflow-common
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__HOSTNAME_CALLABLE: airflow.utils.net.get_host_ip_address
 
     # Banco de metadados do Airflow.
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
@@ -184,6 +185,7 @@ services:
       - bash
       - -c
       - |
+        set -e
         airflow db migrate
         airflow version
 
