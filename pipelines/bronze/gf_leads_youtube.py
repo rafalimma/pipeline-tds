@@ -3,12 +3,15 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-
+from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_NAME = "azure__gf__leads_youtube"
+SOURCE_CONN_ID = "source_pg"
+WEREHOUSE_CONN_ID = "warehouse_pg"
+BATCH_SIZE = 5000
 
+PIPELINE_NAME = "azure__gf__leads_youtube"
 SOURCE_SELECT = """
     SELECT
         id,
@@ -26,12 +29,13 @@ SOURCE_SELECT = """
         utm_campaign,
         utm_id
     FROM gf.leads_youtube
-    WHERE id <= %s
+    WHERE id > %s
+      AND id <= %s
     ORDER BY id
+    LIMIT %s
 """
-
-STAGING_INSERT = """
-    INSERT INTO bronze._stg__azure__gf__leads_youtube (
+TARGET_INSERT = """
+    INSERT INTO bronze.gf_leads_youtube (
         id,
         data_criacao_bd,
         data_submit,
@@ -47,11 +51,94 @@ STAGING_INSERT = """
         utm_campaign,
         utm_id
     )
-    VALUES (
-        %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s
-    )
+    VALUES %s
+    ON CONFLICT (id) DO NOTHING
 """
+
+def incremental_gf_leads_youtube() -> int:
+    source_hook = PostgresHook(postgres_conn_id=SOURCE_CONN_ID)
+    warehouse_hook = PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID)
+
+    source_conn = source_hook.get_conn()
+    warehouse_conn = warehouse_hook.get_conn()
+
+    total_inseridos = 0
+
+    try:
+        # Descobre até qual ID a origem possuía no início da execução.
+        with source_conn.cursor() as source_cursor:
+            source_cursor.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM gf.leads_youtube"
+            )
+            cutoff_id = source_cursor.fetchone()[0]
+
+        # Descobre o último ID já carregado na Bronze.
+        with warehouse_conn.cursor() as warehouse_cursor:
+            warehouse_cursor.execute(
+                """
+                SELECT COALESCE(MAX(id), 0)
+                FROM bronze.gf_leads_youtube
+                """
+            )
+            last_id = warehouse_cursor.fetchone()[0]
+
+        logger.info(
+            "Carga incremental iniciada: last_id=%s, cutoff_id=%s",
+            last_id,
+            cutoff_id,
+        )
+
+        if last_id >= cutoff_id:
+            logger.info("Nenhum registro novo encontrado.")
+            return 0
+
+        while last_id < cutoff_id:
+            with source_conn.cursor() as source_cursor:
+                source_cursor.execute(
+                    SOURCE_SELECT,
+                    (last_id, cutoff_id, BATCH_SIZE),
+                )
+                registros = source_cursor.fetchall()
+
+            if not registros:
+                break
+
+            with warehouse_conn.cursor() as warehouse_cursor:
+                execute_values(
+                    warehouse_cursor,
+                    TARGET_INSERT,
+                    registros,
+                    page_size=BATCH_SIZE,
+                )
+                inseridos_lote = warehouse_cursor.rowcount
+
+            warehouse_conn.commit()
+
+            last_id = registros[-1][0]
+            total_inseridos += inseridos_lote
+
+            logger.info(
+                "Lote concluído: ultimo_id=%s, recebidos=%s, inseridos=%s",
+                last_id,
+                len(registros),
+                inseridos_lote,
+            )
+
+        logger.info(
+            "Carga incremental concluída. Total inserido: %s",
+            total_inseridos,
+        )
+
+        return total_inseridos
+
+    except Exception:
+        warehouse_conn.rollback()
+        logger.exception("Erro durante a carga incremental.")
+        raise
+
+    finally:
+        source_conn.close()
+        warehouse_conn.close()
 
 
 def bootstrap_gf_leads_youtube(
